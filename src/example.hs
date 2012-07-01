@@ -2,7 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 import Data.ByteString.Char8 ()
 import qualified Control.Exception as Exc
-import qualified Database.Hash as HashDB
+import qualified Database.KeyValueHash as HashDB
 
 dbPath :: FilePath
 dbPath = "/tmp/tmpdb"

@@ -1,10 +1,10 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, TemplateHaskell, DeriveDataTypeable #-}
-module Database.Hash
+module Database.KeyValueHash
   ( Key, Value
   , Size, mkSize, sizeLinear
   , HashFunction, stdHash, mkHashFunc
   , Database, createDatabase, openDatabase
-  , readKey, writeKey
+  , readKey, writeKey, deleteKey
   ) where
 
 import Control.Applicative ((<$>), (<*>))
@@ -259,3 +259,14 @@ writeKey db key value = do
   where
     setValue ref nextCollision =
       vprSet ref =<< appendNewValue db nextCollision key value
+
+deleteKey :: Database -> Key -> IO ()
+deleteKey db key = do
+  mResult <- findKey db key
+  case mResult of
+    Just (valuePtrRef, valueHeader) ->
+      -- The old value now becomes unreachable
+      vprSet valuePtrRef $ vhNextCollision valueHeader
+    Nothing ->
+      -- TODO: Throw exception?
+      return ()
