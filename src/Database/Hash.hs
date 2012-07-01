@@ -1,7 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, TemplateHaskell, DeriveDataTypeable #-}
 module Database.Hash
-  ( Key, mkKey
-  , Value
+  ( Key, Value
   , Size, mkSize, sizeLinear
   , HashFunction, stdHash, mkHashFunc
   , Database, createDatabase, openDatabase
@@ -16,6 +15,7 @@ import Data.Binary.Put (runPut)
 import Data.Derive.Binary(makeBinary)
 import Data.DeriveTH(derive)
 import Data.Hashable (Hashable, hash)
+import Data.Monoid (mconcat)
 import Data.Typeable (Typeable)
 import Data.Word (Word8, Word32, Word64)
 import System.FilePath ((</>))
@@ -26,24 +26,8 @@ import qualified System.Directory as Directory
 import qualified System.IO as IO
 
 -- of any length, but long values may be less efficiently handled
+type Key = SBS.ByteString
 type Value = SBS.ByteString
-
-newtype Key = Key {
-  _keyBS :: SBS.ByteString -- Always 16-bytes long
-  } deriving (Binary, Hashable, Eq)
-
--- | mkKey converts a 16-bytes long ByteString to a Key. If given any
--- | other size, throws a pure exception
-mkKey :: SBS.ByteString -> Key
-mkKey bs
-  | len == 16 = Key bs
-  | otherwise =
-    error $ concat ["mkKey Given size: ", show len, " bytes, instead of 16 bytes"]
-  where
-    len = SBS.length bs
-
-zeroKey :: Key
-zeroKey = mkKey $ SBS.replicate 16 0
 
 newtype Size = Size {
   sizeLog :: Word8
@@ -96,9 +80,9 @@ type KeyPtr = Word64 -- index in key file
 type KeyRecord = ValuePtr
 
 data ValueHeader = ValueHeader
-  { vhKey :: Key
-  , vhNextCollision :: ValuePtr
-  , vhSize :: Word32 -- size of this value
+  { vhNextCollision :: ValuePtr
+  , vhKeySize :: Word32
+  , vhValueSize :: Word32
   }
 derive makeBinary ''ValueHeader
 
@@ -120,7 +104,7 @@ keyRecordSize :: Word64
 keyRecordSize = binaryPutSize (0 :: KeyRecord)
 
 valueHeaderSize :: Word64
-valueHeaderSize = binaryPutSize $ ValueHeader zeroKey 0 0
+valueHeaderSize = binaryPutSize $ ValueHeader 0 0 0
 
 makeFileName :: String -> FilePath -> HashFunction -> Size -> FilePath
 makeFileName prefix path func size =
@@ -178,6 +162,9 @@ readFileRange handle (FileRange offset size) = do
   IO.hSeek handle IO.AbsoluteSeek $ fromIntegral offset
   SBS.hGet handle $ fromIntegral size
 
+decodeFileRange :: Binary a => IO.Handle -> FileRange -> IO a
+decodeFileRange handle rng = decode <$> readFileRange handle rng
+
 writeFileRange :: IO.Handle -> Word64 -> SBS.ByteString -> IO ()
 writeFileRange handle offset bs = do
   IO.hSeek handle IO.AbsoluteSeek $ fromIntegral offset
@@ -197,13 +184,22 @@ data ValuePtrRef = ValuePtrRef
 hashValuePtrRef :: Database -> Key -> IO ValuePtrRef
 hashValuePtrRef db key = do
   valuePtr <-
-    fmap decode . readFileRange (dbKeysHandle db) $ keyFileRange keyPtr
+    decodeFileRange (dbKeysHandle db) $ keyFileRange keyPtr
   return ValuePtrRef
     { vprVal = valuePtr
     , vprSet = writeFileRange (dbKeysHandle db) (keyFileOffset keyPtr) . encode
     }
     where
       keyPtr = hashKey db key
+
+valueKeyRange :: ValuePtr -> ValueHeader -> FileRange
+valueKeyRange valuePtr header =
+  FileRange (valuePtr + valueHeaderSize) . fromIntegral $ vhKeySize header
+
+valueDataRange :: ValuePtr -> ValueHeader -> FileRange
+valueDataRange valuePtr header =
+  FileRange (valuePtr + valueHeaderSize + fromIntegral (vhKeySize header)) . fromIntegral $
+  vhValueSize header
 
 findKey :: Database -> Key -> IO (Maybe (ValuePtrRef, ValueHeader))
 findKey db key =
@@ -213,9 +209,12 @@ findKey db key =
       | vprVal valuePtrRef == invalidValuePtr = return Nothing
       | otherwise = do
         valueHeader <-
-          decode <$> readFileRange (dbValuesHandle db)
+          decodeFileRange (dbValuesHandle db)
           (FileRange (vprVal valuePtrRef) valueHeaderSize)
-        if vhKey valueHeader == key
+        vKey <-
+          readFileRange (dbValuesHandle db) $
+          valueKeyRange (vprVal valuePtrRef) valueHeader
+        if key == vKey
           then return $ Just (valuePtrRef, valueHeader)
           else find $ nextCollisionRef (vprVal valuePtrRef) valueHeader
     nextCollisionRef valuePtr valueHeader = ValuePtrRef
@@ -224,14 +223,6 @@ findKey db key =
           writeFileRange (dbValuesHandle db)
           valuePtr . encode . flip (atVhNextCollision . const) valueHeader
         }
-
--- valueRange :: ValuePtr -> ValueHeader -> FileRange
--- valueRange valuePtr header =
---   FileRange valuePtr . (valueHeaderSize +) . fromIntegral $ vhSize header
-
-valueDataRange :: ValuePtr -> ValueHeader -> FileRange
-valueDataRange valuePtr header =
-  FileRange (valuePtr + valueHeaderSize) . fromIntegral $ vhSize header
 
 readKey :: Database -> Key -> IO (Maybe Value)
 readKey db key = do
@@ -243,10 +234,16 @@ readKey db key = do
       readFileRange (dbValuesHandle db)
       (valueDataRange (vprVal valuePtrRef) valueHeader)
 
-appendNewValue :: Database -> Value -> IO ValuePtr
-appendNewValue db val = do
+appendNewValue :: Database -> ValuePtr -> Key -> Value -> IO ValuePtr
+appendNewValue db nextCollision key val = do
   valuePtr <- fromIntegral <$> IO.hFileSize (dbValuesHandle db)
-  writeFileRange (dbValuesHandle db) valuePtr val
+  let
+    headerStr = encode ValueHeader
+      { vhKeySize = fromIntegral $ SBS.length key
+      , vhValueSize = fromIntegral $ SBS.length val
+      , vhNextCollision = nextCollision
+      }
+  writeFileRange (dbValuesHandle db) valuePtr $ mconcat [headerStr, key, val]
   return valuePtr
 
 writeKey :: Database -> Key -> Value -> IO ()
@@ -255,18 +252,10 @@ writeKey db key value = do
   case mResult of
     Just (valuePtrRef, valueHeader) ->
       -- The old value now becomes unreachable
-      setValue valuePtrRef $ valueHeader { vhSize = valueSize }
+      setValue valuePtrRef $ vhNextCollision valueHeader
     Nothing -> do
       hashAnchor <- hashValuePtrRef db key
-      let
-        newHeader =
-          ValueHeader
-          { vhKey = key
-          , vhNextCollision = vprVal hashAnchor
-          , vhSize = valueSize
-          }
-      setValue hashAnchor newHeader
+      setValue hashAnchor $ vprVal hashAnchor
   where
-    setValue ref header =
-      vprSet ref =<< appendNewValue db (SBS.append (encode header) value)
-    valueSize = fromIntegral $ SBS.length value
+    setValue ref nextCollision =
+      vprSet ref =<< appendNewValue db nextCollision key value
