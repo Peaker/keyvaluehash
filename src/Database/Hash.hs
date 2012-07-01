@@ -1,0 +1,272 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving, TemplateHaskell, DeriveDataTypeable #-}
+module Database.Hash
+  ( Key, mkKey
+  , Value
+  , Size, mkSize, sizeLinear
+  , HashFunction, stdHash, mkHashFunc
+  , Database, createDatabase, openDatabase
+  , readKey, writeKey
+  ) where
+
+import Control.Applicative ((<$>), (<*>))
+import Control.Monad (when)
+import Data.Binary (Binary(..))
+import Data.Binary.Get (runGet)
+import Data.Binary.Put (runPut)
+import Data.Derive.Binary(makeBinary)
+import Data.DeriveTH(derive)
+import Data.Hashable (Hashable, hash)
+import Data.Typeable (Typeable)
+import Data.Word (Word8, Word32, Word64)
+import System.FilePath ((</>))
+import qualified Control.Exception as Exc
+import qualified Data.ByteString as SBS
+import qualified Data.ByteString.Lazy as LBS
+import qualified System.Directory as Directory
+import qualified System.IO as IO
+
+-- of any length, but long values may be less efficiently handled
+type Value = SBS.ByteString
+
+newtype Key = Key {
+  _keyBS :: SBS.ByteString -- Always 16-bytes long
+  } deriving (Binary, Hashable, Eq)
+
+-- | mkKey converts a 16-bytes long ByteString to a Key. If given any
+-- | other size, throws a pure exception
+mkKey :: SBS.ByteString -> Key
+mkKey bs
+  | len == 16 = Key bs
+  | otherwise =
+    error $ concat ["mkKey Given size: ", show len, " bytes, instead of 16 bytes"]
+  where
+    len = SBS.length bs
+
+zeroKey :: Key
+zeroKey = mkKey $ SBS.replicate 16 0
+
+newtype Size = Size {
+  sizeLog :: Word8
+  }
+
+sizeLinear :: Size -> Word64
+sizeLinear = (2^) . sizeLog
+
+instance Show Size where
+  show (Size x) = "sz" ++ show x
+
+mkSize :: Word64 -> Size
+mkSize = Size . (ceiling :: Double -> Word8) . logBase 2 . fromIntegral
+
+data HashFunction = HashFunction
+  { hfHash :: Key -> Size -> Word64
+  , hfName :: String
+  }
+
+-- Must not use 0-value because it is used as an invalid value ptr
+cap :: Word64 -> Size -> Word64
+cap val size = val `mod` (sizeLinear size)
+
+mkHashFunc :: String -> (Key -> Word64) -> HashFunction
+mkHashFunc name f = HashFunction
+  { hfName = name
+  , hfHash = cap . f
+  }
+
+stdHash :: HashFunction
+stdHash = mkHashFunc "Hashable" (fromIntegral . hash)
+
+data Database = Database
+  { _dbPath :: FilePath -- directory container
+  , dbSize :: Size
+  , dbHashFunc :: HashFunction
+  , dbKeysHandle :: IO.Handle
+  , dbValuesHandle :: IO.Handle
+  }
+
+data FileRange = FileRange
+  { _frOffset :: Word64
+  , _frSize :: Word64
+  }
+derive makeBinary ''FileRange
+
+type ValuePtr = Word64 -- offset in values file
+type KeyPtr = Word64 -- index in key file
+
+type KeyRecord = ValuePtr
+
+data ValueHeader = ValueHeader
+  { vhKey :: Key
+  , vhNextCollision :: ValuePtr
+  , vhSize :: Word32 -- size of this value
+  }
+derive makeBinary ''ValueHeader
+
+atVhNextCollision :: (ValuePtr -> ValuePtr) -> ValueHeader -> ValueHeader
+atVhNextCollision f v = v { vhNextCollision = f (vhNextCollision v) }
+
+encode :: Binary a => a -> SBS.ByteString
+encode = strictify . runPut . put
+
+decode :: Binary a => SBS.ByteString -> a
+decode = runGet get . lazify
+
+binaryPutSize :: Binary a => a -> Word64
+binaryPutSize = fromIntegral . SBS.length . encode
+
+-- Make a fake KeyRecord because Binary doesn't have a calcSize
+-- operation (TODO: Use my own combinators for fixed-size records)
+keyRecordSize :: Word64
+keyRecordSize = binaryPutSize (0 :: KeyRecord)
+
+valueHeaderSize :: Word64
+valueHeaderSize = binaryPutSize $ ValueHeader zeroKey 0 0
+
+makeFileName :: String -> FilePath -> HashFunction -> Size -> FilePath
+makeFileName prefix path func size =
+  path </> concat [prefix, hfName func, "_", show size]
+
+keysFileName :: FilePath -> HashFunction -> Size -> FilePath
+keysFileName = makeFileName "keys"
+
+valuesFileName :: FilePath -> HashFunction -> Size -> FilePath
+valuesFileName = makeFileName "values"
+
+data FileAlreadyExists = FileAlreadyExists String deriving (Show, Typeable)
+instance Exc.Exception FileAlreadyExists
+assertNotExists :: FilePath -> IO ()
+assertNotExists fileName = do
+  de <- Directory.doesDirectoryExist fileName
+  fe <- Directory.doesFileExist fileName
+  when (de || fe) $ Exc.throwIO (FileAlreadyExists fileName)
+
+createDatabase :: FilePath -> HashFunction -> Size -> IO Database
+createDatabase path func size = do
+  Directory.createDirectory path
+  keysHandle <- mkHandle keysFileName
+  IO.hSetFileSize keysHandle . fromIntegral $ sizeLinear size * keyRecordSize
+  valuesHandle <- mkHandle valuesFileName
+  -- Offset 0 in the values file is used as invalid, so just write a useless 16-byte
+  SBS.hPut valuesHandle $ SBS.replicate 16 0
+  return $ Database path size func keysHandle valuesHandle
+  where
+    mkHandle f = do
+      let fileName = f path func size
+      assertNotExists fileName
+      IO.openFile fileName IO.ReadWriteMode
+
+openDatabase :: FilePath -> HashFunction -> Size -> IO Database
+openDatabase path func size =
+  Database path size func <$> mkHandle keysFileName <*> mkHandle valuesFileName
+  where
+    mkHandle f = IO.openFile (f path func size) IO.ReadWriteMode
+
+hashKey :: Database -> Key -> KeyPtr
+hashKey db key = hfHash (dbHashFunc db) key (dbSize db)
+
+invalidValuePtr :: ValuePtr
+invalidValuePtr = 0
+
+keyFileOffset :: KeyPtr -> Word64
+keyFileOffset = (* keyRecordSize)
+
+keyFileRange :: KeyPtr -> FileRange
+keyFileRange i = FileRange (keyFileOffset i) keyRecordSize
+
+readFileRange :: IO.Handle -> FileRange -> IO SBS.ByteString
+readFileRange handle (FileRange offset size) = do
+  IO.hSeek handle IO.AbsoluteSeek $ fromIntegral offset
+  SBS.hGet handle $ fromIntegral size
+
+writeFileRange :: IO.Handle -> Word64 -> SBS.ByteString -> IO ()
+writeFileRange handle offset bs = do
+  IO.hSeek handle IO.AbsoluteSeek $ fromIntegral offset
+  SBS.hPut handle bs
+
+strictify :: LBS.ByteString -> SBS.ByteString
+strictify = SBS.concat . LBS.toChunks
+
+lazify :: SBS.ByteString -> LBS.ByteString
+lazify = LBS.fromChunks . (: [])
+
+data ValuePtrRef = ValuePtrRef
+  { vprVal :: ValuePtr
+  , vprSet :: ValuePtr -> IO ()
+  }
+
+hashValuePtrRef :: Database -> Key -> IO ValuePtrRef
+hashValuePtrRef db key = do
+  valuePtr <-
+    fmap decode . readFileRange (dbKeysHandle db) $ keyFileRange keyPtr
+  return ValuePtrRef
+    { vprVal = valuePtr
+    , vprSet = writeFileRange (dbKeysHandle db) (keyFileOffset keyPtr) . encode
+    }
+    where
+      keyPtr = hashKey db key
+
+findKey :: Database -> Key -> IO (Maybe (ValuePtrRef, ValueHeader))
+findKey db key =
+  find =<< hashValuePtrRef db key
+  where
+    find valuePtrRef
+      | vprVal valuePtrRef == invalidValuePtr = return Nothing
+      | otherwise = do
+        valueHeader <-
+          decode <$> readFileRange (dbValuesHandle db)
+          (FileRange (vprVal valuePtrRef) valueHeaderSize)
+        if vhKey valueHeader == key
+          then return $ Just (valuePtrRef, valueHeader)
+          else find $ nextCollisionRef (vprVal valuePtrRef) valueHeader
+    nextCollisionRef valuePtr valueHeader = ValuePtrRef
+        { vprVal = vhNextCollision valueHeader
+        , vprSet =
+          writeFileRange (dbValuesHandle db)
+          valuePtr . encode . flip (atVhNextCollision . const) valueHeader
+        }
+
+-- valueRange :: ValuePtr -> ValueHeader -> FileRange
+-- valueRange valuePtr header =
+--   FileRange valuePtr . (valueHeaderSize +) . fromIntegral $ vhSize header
+
+valueDataRange :: ValuePtr -> ValueHeader -> FileRange
+valueDataRange valuePtr header =
+  FileRange (valuePtr + valueHeaderSize) . fromIntegral $ vhSize header
+
+readKey :: Database -> Key -> IO (Maybe Value)
+readKey db key = do
+  mValueRange <- findKey db key
+  case mValueRange of
+    Nothing -> return Nothing
+    Just (valuePtrRef, valueHeader) ->
+      Just <$>
+      readFileRange (dbValuesHandle db)
+      (valueDataRange (vprVal valuePtrRef) valueHeader)
+
+appendNewValue :: Database -> Value -> IO ValuePtr
+appendNewValue db val = do
+  valuePtr <- fromIntegral <$> IO.hFileSize (dbValuesHandle db)
+  writeFileRange (dbValuesHandle db) valuePtr val
+  return valuePtr
+
+writeKey :: Database -> Key -> Value -> IO ()
+writeKey db key value = do
+  mResult <- findKey db key
+  case mResult of
+    Just (valuePtrRef, valueHeader) ->
+      -- The old value now becomes unreachable
+      setValue valuePtrRef $ valueHeader { vhSize = valueSize }
+    Nothing -> do
+      hashAnchor <- hashValuePtrRef db key
+      let
+        newHeader =
+          ValueHeader
+          { vhKey = key
+          , vhNextCollision = vprVal hashAnchor
+          , vhSize = valueSize
+          }
+      setValue hashAnchor newHeader
+  where
+    setValue ref header =
+      vprSet ref =<< appendNewValue db (SBS.append (encode header) value)
+    valueSize = fromIntegral $ SBS.length value
