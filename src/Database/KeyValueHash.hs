@@ -16,6 +16,7 @@ import Data.Binary.Put (runPut)
 import Data.Derive.Binary(makeBinary)
 import Data.DeriveTH(derive)
 import Data.Hashable (Hashable, hash)
+import Data.List (intercalate)
 import Data.Monoid (mconcat)
 import Data.Typeable (Typeable)
 import Data.Word (Word8, Word32, Word64)
@@ -111,7 +112,7 @@ valueHeaderSize = binaryPutSize $ ValueHeader 0 0 0 0
 
 makeFileName :: String -> FilePath -> HashFunction -> Size -> FilePath
 makeFileName prefix path func size =
-  path </> concat [prefix, hfName func, "_", show size]
+  path </> intercalate "_" [prefix, hfName func, show size]
 
 keysFileName :: FilePath -> HashFunction -> Size -> FilePath
 keysFileName = makeFileName "keys"
@@ -279,7 +280,8 @@ writeKey db key value = do
       if vhAllocSize valueHeader >= keyLen + valueLen then
         -- re-use existing storage:
         let headerStr = encode valueHeader { vhKeySize = keyLen, vhValueSize = valueLen }
-        in writeFileRange (dbValuesHandle db) (vprVal valuePtrRef) $ mconcat [headerStr, key, value]
+        in writeFileRange (dbValuesHandle db) (vprVal valuePtrRef) $
+           mconcat [headerStr, key, value]
       else
         -- The old value now becomes unreachable
         setValue valuePtrRef $ vhNextCollision valueHeader
