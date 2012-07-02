@@ -82,6 +82,8 @@ type KeyRecord = ValuePtr
 
 data ValueHeader = ValueHeader
   { vhNextCollision :: ValuePtr
+    -- if value is re-written multiple times, we can do it in-place as long as it fits
+  , vhAllocSize :: Word32
   , vhKeySize :: Word32
   , vhValueSize :: Word32
   }
@@ -105,7 +107,7 @@ keyRecordSize :: Word64
 keyRecordSize = binaryPutSize (0 :: KeyRecord)
 
 valueHeaderSize :: Word64
-valueHeaderSize = binaryPutSize $ ValueHeader 0 0 0
+valueHeaderSize = binaryPutSize $ ValueHeader 0 0 0 0
 
 makeFileName :: String -> FilePath -> HashFunction -> Size -> FilePath
 makeFileName prefix path func size =
@@ -248,29 +250,44 @@ readKey db key = do
       readFileRange (dbValuesHandle db)
       (valueDataRange (vprVal valuePtrRef) valueHeader)
 
+pairLengths :: Key -> Value -> (Word32, Word32)
+pairLengths key value = (keyLen, valueLen)
+  where
+    keyLen = fromIntegral $ SBS.length key
+    valueLen = fromIntegral $ SBS.length value
+
 appendNewValue :: Database -> ValuePtr -> Key -> Value -> IO ValuePtr
-appendNewValue db nextCollision key val = do
+appendNewValue db nextCollision key value = do
   valuePtr <- fromIntegral <$> IO.hFileSize (dbValuesHandle db)
   let
     headerStr = encode ValueHeader
-      { vhKeySize = fromIntegral $ SBS.length key
-      , vhValueSize = fromIntegral $ SBS.length val
-      , vhNextCollision = nextCollision
+      { vhNextCollision = nextCollision
+      , vhAllocSize = keyLen + valueLen
+      , vhKeySize = keyLen
+      , vhValueSize = valueLen
       }
-  writeFileRange (dbValuesHandle db) valuePtr $ mconcat [headerStr, key, val]
+  writeFileRange (dbValuesHandle db) valuePtr $ mconcat [headerStr, key, value]
   return valuePtr
+  where
+    (keyLen, valueLen) = pairLengths key value
 
 writeKey :: Database -> Key -> Value -> IO ()
 writeKey db key value = do
   mResult <- findKey db key
   case mResult of
     Just (valuePtrRef, valueHeader) ->
-      -- The old value now becomes unreachable
-      setValue valuePtrRef $ vhNextCollision valueHeader
+      if vhAllocSize valueHeader >= keyLen + valueLen then
+        -- re-use existing storage:
+        let headerStr = encode valueHeader { vhKeySize = keyLen, vhValueSize = valueLen }
+        in writeFileRange (dbValuesHandle db) (vprVal valuePtrRef) $ mconcat [headerStr, key, value]
+      else
+        -- The old value now becomes unreachable
+        setValue valuePtrRef $ vhNextCollision valueHeader
     Nothing -> do
       hashAnchor <- hashValuePtrRef db key
       setValue hashAnchor $ vprVal hashAnchor
   where
+    (keyLen, valueLen) = pairLengths key value
     setValue ref nextCollision =
       vprSet ref =<< appendNewValue db nextCollision key value
 
