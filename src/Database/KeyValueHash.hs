@@ -3,7 +3,8 @@ module Database.KeyValueHash
   ( Key, Value
   , Size, mkSize, sizeLinear
   , HashFunction, stdHash, mkHashFunc
-  , Database, createDatabase, openDatabase
+  , Database, createDatabase, openDatabase, closeDatabase
+  , withCreateDatabase, withOpenDatabase
   , readKey, writeKey, deleteKey
   ) where
 
@@ -144,6 +145,19 @@ openDatabase path func size =
   Database path size func <$> mkHandle keysFileName <*> mkHandle valuesFileName
   where
     mkHandle f = IO.openFile (f path func size) IO.ReadWriteMode
+
+closeDatabase :: Database -> IO ()
+closeDatabase db = do
+  IO.hClose $ dbKeysHandle db
+  IO.hClose $ dbValuesHandle db
+
+withCreateDatabase :: FilePath -> HashFunction -> Size -> (Database -> IO a) -> IO a
+withCreateDatabase path func size =
+  Exc.bracket (createDatabase path func size) closeDatabase
+
+withOpenDatabase :: FilePath -> HashFunction -> Size -> (Database -> IO a) -> IO a
+withOpenDatabase path func size =
+  Exc.bracket (openDatabase path func size) closeDatabase
 
 hashKey :: Database -> Key -> KeyPtr
 hashKey db key = hfHash (dbHashFunc db) key (dbSize db)
