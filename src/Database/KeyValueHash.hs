@@ -10,8 +10,6 @@ module Database.KeyValueHash
 
 import Control.Applicative ((<$>))
 import Control.Monad (when)
-import Data.Array.Storable (StorableArray)
-import Data.Array.Unsafe (unsafeForeignPtrToStorableArray)
 import Data.Binary (Binary(..))
 import Data.Binary.Get (runGet)
 import Data.Binary.Put (runPut)
@@ -23,12 +21,13 @@ import Data.List (intercalate)
 import Data.Monoid (mconcat)
 import Data.Typeable (Typeable)
 import Data.Word (Word8, Word32, Word64)
-import Foreign.ForeignPtr (ForeignPtr, finalizeForeignPtr)
+import Foreign.ForeignPtr (ForeignPtr, finalizeForeignPtr, withForeignPtr)
+import Foreign.Ptr (plusPtr)
 import System.FilePath ((</>))
 import qualified Control.Exception as Exc
-import qualified Data.Array.MArray as MArray
 import qualified Data.ByteString as SBS
 import qualified Data.ByteString.Lazy as LBS
+import qualified Foreign.Storable as Storable
 import qualified System.Directory as Directory
 import qualified System.IO as IO
 import qualified System.IO.MMap as MMap
@@ -92,7 +91,6 @@ data Database = Database
   , dbSize :: Size
   , dbHashFunc :: HashFunction
   , dbKeysMMap :: ForeignPtr KeyRecord
-  , dbKeysArray :: StorableArray KeyPtr KeyRecord
   , dbValuesHandle :: IO.Handle
   }
 
@@ -160,8 +158,7 @@ openDatabase path func size = do
     MMap.mmapFileForeignPtr (keysFileName path func size) MMap.ReadWrite Nothing
   when (fromIntegral mapSize < keyCount * keyRecordSize) .
     Exc.throwIO . FileAlreadyExists $ keysFileName path func size -- TODO: Better exception
-  keysArray <- unsafeForeignPtrToStorableArray keysMMap (0, keyCount-1)
-  Database path size func keysMMap keysArray <$> mkHandle valuesFileName
+  Database path size func keysMMap <$> mkHandle valuesFileName
   where
     keyCount = sizeLinear size
     mkHandle f = IO.openBinaryFile (f path func size) IO.ReadWriteMode
@@ -211,13 +208,15 @@ data ValuePtrRef = ValuePtrRef
 
 hashValuePtrRef :: Database -> Key -> IO ValuePtrRef
 hashValuePtrRef db key = do
-  valuePtr <- MArray.readArray (dbKeysArray db) keyPtr
-  return ValuePtrRef
-    { vprVal = valuePtr
-    , vprSet = MArray.writeArray (dbKeysArray db) keyPtr
-    }
-    where
-      keyPtr = hashKey db key
+  withForeignPtr (dbKeysMMap db) $ \keysPtr -> do
+    let keyPtr = keysPtr `plusPtr` fromIntegral (keyIndex * keyRecordSize)
+    valuePtr <- Storable.peek keyPtr
+    return ValuePtrRef
+      { vprVal = valuePtr
+      , vprSet = Storable.poke keyPtr
+      }
+      where
+        keyIndex = hashKey db key
 
 valueKeyRange :: ValuePtr -> ValueHeader -> FileRange
 valueKeyRange valuePtr header =
