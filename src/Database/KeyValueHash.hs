@@ -8,11 +8,14 @@ module Database.KeyValueHash
   , readKey, writeKey, deleteKey
   ) where
 
-import Control.Applicative ((<$>), (<*>))
+import Control.Applicative ((<$>))
 import Control.Monad (when)
+import Data.Array.Storable (StorableArray)
+import Data.Array.Unsafe (unsafeForeignPtrToStorableArray)
 import Data.Binary (Binary(..))
 import Data.Binary.Get (runGet)
 import Data.Binary.Put (runPut)
+import Data.Bits (Bits, (.&.), complement)
 import Data.Derive.Binary(makeBinary)
 import Data.DeriveTH(derive)
 import Data.Hashable (Hashable, hash)
@@ -20,12 +23,15 @@ import Data.List (intercalate)
 import Data.Monoid (mconcat)
 import Data.Typeable (Typeable)
 import Data.Word (Word8, Word32, Word64)
+import Foreign.ForeignPtr (ForeignPtr, finalizeForeignPtr)
 import System.FilePath ((</>))
 import qualified Control.Exception as Exc
+import qualified Data.Array.MArray as MArray
 import qualified Data.ByteString as SBS
 import qualified Data.ByteString.Lazy as LBS
 import qualified System.Directory as Directory
 import qualified System.IO as IO
+import qualified System.IO.MMap as MMap
 
 -- of any length, but long values may be less efficiently handled
 type Key = SBS.ByteString
@@ -62,24 +68,15 @@ mkHashFunc name f = HashFunction
 stdHash :: HashFunction
 stdHash = mkHashFunc "Hashable" (fromIntegral . hash)
 
-data Database = Database
-  { _dbPath :: FilePath -- directory container
-  , dbSize :: Size
-  , dbHashFunc :: HashFunction
-  , dbKeysHandle :: IO.Handle
-  , dbValuesHandle :: IO.Handle
-  }
+type ValuePtr = Word64 -- offset in values file
+type KeyPtr = Word64 -- index in key file
+type KeyRecord = ValuePtr
 
 data FileRange = FileRange
   { _frOffset :: Word64
   , _frSize :: Word64
   }
 derive makeBinary ''FileRange
-
-type ValuePtr = Word64 -- offset in values file
-type KeyPtr = Word64 -- index in key file
-
-type KeyRecord = ValuePtr
 
 data ValueHeader = ValueHeader
   { vhNextCollision :: ValuePtr
@@ -89,6 +86,15 @@ data ValueHeader = ValueHeader
   , vhValueSize :: Word32
   }
 derive makeBinary ''ValueHeader
+
+data Database = Database
+  { _dbPath :: FilePath -- directory container
+  , dbSize :: Size
+  , dbHashFunc :: HashFunction
+  , dbKeysMMap :: ForeignPtr KeyRecord
+  , dbKeysArray :: StorableArray KeyPtr KeyRecord
+  , dbValuesHandle :: IO.Handle
+  }
 
 atVhNextCollision :: (ValuePtr -> ValuePtr) -> ValueHeader -> ValueHeader
 atVhNextCollision f v = v { vhNextCollision = f (vhNextCollision v) }
@@ -128,30 +134,41 @@ assertNotExists fileName = do
   fe <- Directory.doesFileExist fileName
   when (de || fe) $ Exc.throwIO (FileAlreadyExists fileName)
 
+alignPage :: Bits a => a -> a
+alignPage x = (x + 0xFFF) .&. complement 0xFFF
+
 createDatabase :: FilePath -> HashFunction -> Size -> IO Database
 createDatabase path func size = do
   Directory.createDirectory path
-  keysHandle <- mkHandle keysFileName
-  IO.hSetFileSize keysHandle . fromIntegral $ sizeLinear size * keyRecordSize
-  valuesHandle <- mkHandle valuesFileName
-  -- Offset 0 in the values file is used as invalid, so just write a useless 16-byte
-  SBS.hPut valuesHandle $ SBS.replicate 16 0
-  return $ Database path size func keysHandle valuesHandle
+  mapM_ assertNotExists [keysFN, valuesFN]
+
+  IO.withBinaryFile keysFN IO.ReadWriteMode $ \handle ->
+    IO.hSetFileSize handle . alignPage . fromIntegral $
+    sizeLinear size * keyRecordSize
+
+  IO.withBinaryFile valuesFN IO.ReadWriteMode $ \handle ->
+    -- Offset 0 in the values file is used as invalid, so just write a useless 16-byte
+    SBS.hPut handle $ SBS.replicate 16 0
+  openDatabase path func size
   where
-    mkHandle f = do
-      let fileName = f path func size
-      assertNotExists fileName
-      IO.openFile fileName IO.ReadWriteMode
+    keysFN = keysFileName path func size
+    valuesFN = valuesFileName path func size
 
 openDatabase :: FilePath -> HashFunction -> Size -> IO Database
-openDatabase path func size =
-  Database path size func <$> mkHandle keysFileName <*> mkHandle valuesFileName
+openDatabase path func size = do
+  (keysMMap, 0, mapSize) <-
+    MMap.mmapFileForeignPtr (keysFileName path func size) MMap.ReadWrite Nothing
+  when (fromIntegral mapSize < keyCount * keyRecordSize) .
+    Exc.throwIO . FileAlreadyExists $ keysFileName path func size -- TODO: Better exception
+  keysArray <- unsafeForeignPtrToStorableArray keysMMap (0, keyCount-1)
+  Database path size func keysMMap keysArray <$> mkHandle valuesFileName
   where
-    mkHandle f = IO.openFile (f path func size) IO.ReadWriteMode
+    keyCount = sizeLinear size
+    mkHandle f = IO.openBinaryFile (f path func size) IO.ReadWriteMode
 
 closeDatabase :: Database -> IO ()
 closeDatabase db = do
-  IO.hClose $ dbKeysHandle db
+  finalizeForeignPtr $ dbKeysMMap db
   IO.hClose $ dbValuesHandle db
 
 withCreateDatabase :: FilePath -> HashFunction -> Size -> (Database -> IO a) -> IO a
@@ -167,12 +184,6 @@ hashKey db key = hfHash (dbHashFunc db) key (dbSize db)
 
 invalidValuePtr :: ValuePtr
 invalidValuePtr = 0
-
-keyFileOffset :: KeyPtr -> Word64
-keyFileOffset = (* keyRecordSize)
-
-keyFileRange :: KeyPtr -> FileRange
-keyFileRange i = FileRange (keyFileOffset i) keyRecordSize
 
 readFileRange :: IO.Handle -> FileRange -> IO SBS.ByteString
 readFileRange handle (FileRange offset size) = do
@@ -200,11 +211,10 @@ data ValuePtrRef = ValuePtrRef
 
 hashValuePtrRef :: Database -> Key -> IO ValuePtrRef
 hashValuePtrRef db key = do
-  valuePtr <-
-    decodeFileRange (dbKeysHandle db) $ keyFileRange keyPtr
+  valuePtr <- MArray.readArray (dbKeysArray db) keyPtr
   return ValuePtrRef
     { vprVal = valuePtr
-    , vprSet = writeFileRange (dbKeysHandle db) (keyFileOffset keyPtr) . encode
+    , vprSet = MArray.writeArray (dbKeysArray db) keyPtr
     }
     where
       keyPtr = hashKey db key
