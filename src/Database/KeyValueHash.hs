@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, TemplateHaskell, DeriveDataTypeable #-}
+{-# LANGUAGE TemplateHaskell, DeriveDataTypeable #-}
 module Database.KeyValueHash
   ( Key, Value
   , Size, mkSize, sizeLinear
@@ -13,7 +13,6 @@ import Control.Monad (when)
 import Data.Binary (Binary(..))
 import Data.Binary.Get (runGet)
 import Data.Binary.Put (runPut)
-import Data.Bits (Bits, (.&.), complement)
 import Data.Derive.Binary(makeBinary)
 import Data.DeriveTH(derive)
 import Data.Hashable (Hashable, hash)
@@ -21,16 +20,14 @@ import Data.List (intercalate)
 import Data.Monoid (mconcat)
 import Data.Typeable (Typeable)
 import Data.Word (Word8, Word32, Word64)
-import Foreign.ForeignPtr (ForeignPtr, finalizeForeignPtr, withForeignPtr)
-import Foreign.Ptr (plusPtr)
+import Database.FileArray (FileArray)
 import System.FilePath ((</>))
 import qualified Control.Exception as Exc
 import qualified Data.ByteString as SBS
 import qualified Data.ByteString.Lazy as LBS
-import qualified Foreign.Storable as Storable
+import qualified Database.FileArray as FileArray
 import qualified System.Directory as Directory
 import qualified System.IO as IO
-import qualified System.IO.MMap as MMap
 
 -- of any length, but long values may be less efficiently handled
 type Key = SBS.ByteString
@@ -90,7 +87,7 @@ data Database = Database
   { _dbPath :: FilePath -- directory container
   , dbSize :: Size
   , dbHashFunc :: HashFunction
-  , dbKeysMMap :: ForeignPtr KeyRecord
+  , dbKeysArray :: FileArray KeyRecord
   , dbValuesHandle :: IO.Handle
   }
 
@@ -105,11 +102,6 @@ decode = runGet get . lazify
 
 binaryPutSize :: Binary a => a -> Word64
 binaryPutSize = fromIntegral . SBS.length . encode
-
--- Make a fake KeyRecord because Binary doesn't have a calcSize
--- operation (TODO: Use my own combinators for fixed-size records)
-keyRecordSize :: Word64
-keyRecordSize = binaryPutSize (0 :: KeyRecord)
 
 valueHeaderSize :: Word64
 valueHeaderSize = binaryPutSize $ ValueHeader 0 0 0 0
@@ -132,40 +124,30 @@ assertNotExists fileName = do
   fe <- Directory.doesFileExist fileName
   when (de || fe) $ Exc.throwIO (FileAlreadyExists fileName)
 
-alignPage :: Bits a => a -> a
-alignPage x = (x + 0xFFF) .&. complement 0xFFF
-
 createDatabase :: FilePath -> HashFunction -> Size -> IO Database
 createDatabase path func size = do
   Directory.createDirectory path
   mapM_ assertNotExists [keysFN, valuesFN]
 
-  IO.withBinaryFile keysFN IO.ReadWriteMode $ \handle ->
-    IO.hSetFileSize handle . alignPage . fromIntegral $
-    sizeLinear size * keyRecordSize
+  keysArray <- FileArray.create keysFN $ sizeLinear size
 
   IO.withBinaryFile valuesFN IO.ReadWriteMode $ \handle ->
     -- Offset 0 in the values file is used as invalid, so just write a useless 16-byte
     SBS.hPut handle $ SBS.replicate 16 0
-  openDatabase path func size
+  Database path size func keysArray <$> IO.openBinaryFile valuesFN IO.ReadWriteMode
   where
     keysFN = keysFileName path func size
     valuesFN = valuesFileName path func size
 
 openDatabase :: FilePath -> HashFunction -> Size -> IO Database
 openDatabase path func size = do
-  (keysMMap, 0, mapSize) <-
-    MMap.mmapFileForeignPtr (keysFileName path func size) MMap.ReadWrite Nothing
-  when (fromIntegral mapSize < keyCount * keyRecordSize) .
-    Exc.throwIO . FileAlreadyExists $ keysFileName path func size -- TODO: Better exception
-  Database path size func keysMMap <$> mkHandle valuesFileName
-  where
-    keyCount = sizeLinear size
-    mkHandle f = IO.openBinaryFile (f path func size) IO.ReadWriteMode
+  keysArray <- FileArray.open (keysFileName path func size) (sizeLinear size)
+  Database path size func keysArray <$>
+    IO.openBinaryFile (valuesFileName path func size) IO.ReadWriteMode
 
 closeDatabase :: Database -> IO ()
 closeDatabase db = do
-  finalizeForeignPtr $ dbKeysMMap db
+  FileArray.close $ dbKeysArray db
   IO.hClose $ dbValuesHandle db
 
 withCreateDatabase :: FilePath -> HashFunction -> Size -> (Database -> IO a) -> IO a
@@ -208,15 +190,12 @@ data ValuePtrRef = ValuePtrRef
 
 hashValuePtrRef :: Database -> Key -> IO ValuePtrRef
 hashValuePtrRef db key = do
-  withForeignPtr (dbKeysMMap db) $ \keysPtr -> do
-    let keyPtr = keysPtr `plusPtr` fromIntegral (keyIndex * keyRecordSize)
-    valuePtr <- Storable.peek keyPtr
-    return ValuePtrRef
-      { vprVal = valuePtr
-      , vprSet = Storable.poke keyPtr
-      }
-      where
-        keyIndex = hashKey db key
+  element <- FileArray.unsafeElement (dbKeysArray db) $ hashKey db key
+  valuePtr <- FileArray.read element
+  return ValuePtrRef
+    { vprVal = valuePtr
+    , vprSet = FileArray.write element
+    }
 
 valueKeyRange :: ValuePtr -> ValueHeader -> FileRange
 valueKeyRange valuePtr header =
