@@ -14,7 +14,7 @@ cabal-version:       >=1.8
 library
   hs-Source-Dirs:      src
   exposed-modules:     Database.KeyValueHash
-  -- other-modules:       
+  other-modules:       Database.GrowingFile, Database.FileArray
   build-depends:       base >=4.5 && <10, filepath, directory, bytestring, hashable,
                        binary, derive, mmap, array, storable-record
   ghc-options:         -O2 -Wall
