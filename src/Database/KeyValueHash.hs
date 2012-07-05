@@ -8,7 +8,7 @@ module Database.KeyValueHash
   , readKey, writeKey, deleteKey
   ) where
 
-import Control.Applicative ((<$>))
+import Control.Applicative ((<$>), (<*>))
 import Control.Monad (when)
 import Data.Binary (Binary(..))
 import Data.Binary.Get (runGet)
@@ -21,13 +21,17 @@ import Data.Monoid (mconcat)
 import Data.Typeable (Typeable)
 import Data.Word (Word8, Word32, Word64)
 import Database.FileArray (FileArray)
+import Database.GrowingFile (GrowingFile)
 import System.FilePath ((</>))
 import qualified Control.Exception as Exc
 import qualified Data.ByteString as SBS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Database.FileArray as FileArray
+import qualified Database.GrowingFile as GrowingFile
 import qualified System.Directory as Directory
-import qualified System.IO as IO
+
+valuesGrowthSize :: Word64
+valuesGrowthSize = 128 * 1024
 
 -- of any length, but long values may be less efficiently handled
 type Key = SBS.ByteString
@@ -69,9 +73,9 @@ type KeyPtr = Word64 -- index in key file
 type KeyRecord = ValuePtr
 
 data FileRange = FileRange
-  { _frOffset :: Word64
-  , _frSize :: Word64
-  }
+  { frOffset :: Word64
+  , frSize :: Word64
+  } deriving (Show)
 derive makeBinary ''FileRange
 
 data ValueHeader = ValueHeader
@@ -88,7 +92,7 @@ data Database = Database
   , dbSize :: Size
   , dbHashFunc :: HashFunction
   , dbKeysArray :: FileArray KeyRecord
-  , dbValuesHandle :: IO.Handle
+  , dbValues :: GrowingFile
   }
 
 atVhNextCollision :: (ValuePtr -> ValuePtr) -> ValueHeader -> ValueHeader
@@ -128,27 +132,23 @@ createDatabase :: FilePath -> HashFunction -> Size -> IO Database
 createDatabase path func size = do
   Directory.createDirectory path
   mapM_ assertNotExists [keysFN, valuesFN]
-
-  keysArray <- FileArray.create keysFN $ sizeLinear size
-
-  IO.withBinaryFile valuesFN IO.ReadWriteMode $ \handle ->
-    -- Offset 0 in the values file is used as invalid, so just write a useless 16-byte
-    SBS.hPut handle $ SBS.replicate 16 0
-  Database path size func keysArray <$> IO.openBinaryFile valuesFN IO.ReadWriteMode
+  Database path size func
+    <$> FileArray.create keysFN (sizeLinear size)
+    <*> GrowingFile.create valuesFN valuesGrowthSize
   where
     keysFN = keysFileName path func size
     valuesFN = valuesFileName path func size
 
 openDatabase :: FilePath -> HashFunction -> Size -> IO Database
-openDatabase path func size = do
-  keysArray <- FileArray.open (keysFileName path func size) (sizeLinear size)
-  Database path size func keysArray <$>
-    IO.openBinaryFile (valuesFileName path func size) IO.ReadWriteMode
+openDatabase path func size =
+  Database path size func
+    <$> FileArray.open (keysFileName path func size) (sizeLinear size)
+    <*> GrowingFile.open (valuesFileName path func size) valuesGrowthSize
 
 closeDatabase :: Database -> IO ()
 closeDatabase db = do
   FileArray.close $ dbKeysArray db
-  IO.hClose $ dbValuesHandle db
+  GrowingFile.close $ dbValues db
 
 withCreateDatabase :: FilePath -> HashFunction -> Size -> (Database -> IO a) -> IO a
 withCreateDatabase path func size =
@@ -164,18 +164,14 @@ hashKey db key = hfHash (dbHashFunc db) key (dbSize db)
 invalidValuePtr :: ValuePtr
 invalidValuePtr = 0
 
-readFileRange :: IO.Handle -> FileRange -> IO SBS.ByteString
-readFileRange handle (FileRange offset size) = do
-  IO.hSeek handle IO.AbsoluteSeek $ fromIntegral offset
-  SBS.hGet handle $ fromIntegral size
+readRange :: GrowingFile -> FileRange -> IO SBS.ByteString
+readRange gfile rng = GrowingFile.readRange gfile (frOffset rng) (frSize rng)
 
-decodeFileRange :: Binary a => IO.Handle -> FileRange -> IO a
-decodeFileRange handle rng = decode <$> readFileRange handle rng
+writeRange :: GrowingFile -> Word64 -> SBS.ByteString -> IO ()
+writeRange gfile offset bs = GrowingFile.writeRange gfile offset bs
 
-writeFileRange :: IO.Handle -> Word64 -> SBS.ByteString -> IO ()
-writeFileRange handle offset bs = do
-  IO.hSeek handle IO.AbsoluteSeek $ fromIntegral offset
-  SBS.hPut handle bs
+decodeFileRange :: Binary a => GrowingFile -> FileRange -> IO a
+decodeFileRange gfile rng = decode <$> readRange gfile rng
 
 strictify :: LBS.ByteString -> SBS.ByteString
 strictify = SBS.concat . LBS.toChunks
@@ -214,19 +210,17 @@ findKey db key =
       | vprVal valuePtrRef == invalidValuePtr = return Nothing
       | otherwise = do
         valueHeader <-
-          decodeFileRange (dbValuesHandle db)
+          decodeFileRange (dbValues db)
           (FileRange (vprVal valuePtrRef) valueHeaderSize)
-        vKey <-
-          readFileRange (dbValuesHandle db) $
-          valueKeyRange (vprVal valuePtrRef) valueHeader
+        vKey <- readRange (dbValues db) $ valueKeyRange (vprVal valuePtrRef) valueHeader
         if key == vKey
           then return $ Just (valuePtrRef, valueHeader)
           else find $ nextCollisionRef (vprVal valuePtrRef) valueHeader
     nextCollisionRef valuePtr valueHeader = ValuePtrRef
         { vprVal = vhNextCollision valueHeader
         , vprSet =
-          writeFileRange (dbValuesHandle db)
-          valuePtr . encode . flip (atVhNextCollision . const) valueHeader
+          writeRange (dbValues db) valuePtr .
+          encode . flip (atVhNextCollision . const) valueHeader
         }
 
 readKey :: Database -> Key -> IO (Maybe Value)
@@ -235,9 +229,7 @@ readKey db key = do
   case mValueRange of
     Nothing -> return Nothing
     Just (valuePtrRef, valueHeader) ->
-      Just <$>
-      readFileRange (dbValuesHandle db)
-      (valueDataRange (vprVal valuePtrRef) valueHeader)
+      Just <$> readRange (dbValues db) (valueDataRange (vprVal valuePtrRef) valueHeader)
 
 pairLengths :: Key -> Value -> (Word32, Word32)
 pairLengths key value = (keyLen, valueLen)
@@ -246,18 +238,15 @@ pairLengths key value = (keyLen, valueLen)
     valueLen = fromIntegral $ SBS.length value
 
 appendNewValue :: Database -> ValuePtr -> Key -> Value -> IO ValuePtr
-appendNewValue db nextCollision key value = do
-  valuePtr <- fromIntegral <$> IO.hFileSize (dbValuesHandle db)
-  let
+appendNewValue db nextCollision key value =
+  GrowingFile.append (dbValues db) $ mconcat [headerStr, key, value]
+  where
     headerStr = encode ValueHeader
       { vhNextCollision = nextCollision
       , vhAllocSize = keyLen + valueLen
       , vhKeySize = keyLen
       , vhValueSize = valueLen
       }
-  writeFileRange (dbValuesHandle db) valuePtr $ mconcat [headerStr, key, value]
-  return valuePtr
-  where
     (keyLen, valueLen) = pairLengths key value
 
 writeKey :: Database -> Key -> Value -> IO ()
@@ -268,7 +257,7 @@ writeKey db key value = do
       if vhAllocSize valueHeader >= keyLen + valueLen then
         -- re-use existing storage:
         let headerStr = encode valueHeader { vhKeySize = keyLen, vhValueSize = valueLen }
-        in writeFileRange (dbValuesHandle db) (vprVal valuePtrRef) $
+        in writeRange (dbValues db) (vprVal valuePtrRef) $
            mconcat [headerStr, key, value]
       else
         -- The old value now becomes unreachable
