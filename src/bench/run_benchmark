@@ -1,4 +1,4 @@
-ghc -O2 --make benchmark.hs || exit 1
+ghc -O2 -i.. --make benchmark.hs || exit 1
 git log -1  >  benchmark_results.$(git log --pretty=oneline -1 HEAD|awk '{print $1}')
 rm -rf /tmp/tmpdb
 echo "clean file" >> benchmark_results.$(git log --pretty=oneline -1 HEAD|awk '{print $1}')
