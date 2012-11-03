@@ -1,5 +1,5 @@
 name:                keyvaluehash
-version:             0.3.0.1
+version:             0.3.0.2
 synopsis:            Pure Haskell key/value store implementation
 -- description:         
 license:             BSD3

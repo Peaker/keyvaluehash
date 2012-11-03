@@ -28,7 +28,7 @@ data Element a = Element
   , write :: a -> IO ()
   }
 
-alignPage :: Bits a => a -> a
+alignPage :: (Num a, Bits a) => a -> a
 alignPage x = (x + 0xFFF) .&. complement 0xFFF
 
 sizeOf :: Storable a => a -> Word64
@@ -64,7 +64,6 @@ elementSize :: forall a. Storable a => FileArray a -> Word64
 elementSize _ = sizeOf (undefined :: a)
 
 {-# INLINE unsafeElement #-}
-{-# SPECIALIZE unsafeElement :: FileArray Word64 -> Word64 -> IO (Element Word64) #-}
 unsafeElement :: Storable a => FileArray a -> Word64 -> IO (Element a)
 unsafeElement fileArray ix =
   withForeignPtr (faPtr fileArray) $ \keysPtr -> do
