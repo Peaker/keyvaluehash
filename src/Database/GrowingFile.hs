@@ -4,6 +4,7 @@ module Database.GrowingFile
   , create, open, close
   , readRange, writeRange
   , append
+  , msync
   ) where
 
 import Control.Applicative (liftA2)
@@ -22,6 +23,7 @@ import qualified Data.ByteString as SBS
 import qualified Foreign.Storable as Storable
 import qualified System.IO as IO
 import qualified System.IO.MMap as MMap
+import qualified System.IO.MMap.Sync as MMapSync
 
 data Header = Header
   { hAllocated :: Word64
@@ -152,3 +154,10 @@ append gfile bs = do
   resize gfile header newUsed
   writeRange gfile curUsed bs
   return curUsed
+
+msync :: GrowingFile -> IO ()
+msync gfile = do
+  header <- readHeader gfile
+  fptr <- readIORef (gfPtr gfile)
+  withForeignPtr fptr $ \ptr ->
+    MMapSync.msync ptr (fromIntegral (hUsed header)) (Just MMapSync.Async) MMapSync.NoInvalidate

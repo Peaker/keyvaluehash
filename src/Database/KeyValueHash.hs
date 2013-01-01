@@ -6,6 +6,7 @@ module Database.KeyValueHash
   , Database, createDatabase, openDatabase, closeDatabase
   , withCreateDatabase, withOpenDatabase
   , readKey, writeKey, deleteKey
+  , msync
   ) where
 
 import Control.Applicative ((<$>), (<*>))
@@ -280,3 +281,8 @@ deleteKey db key = do
     Nothing ->
       -- TODO: Throw exception?
       return ()
+
+msync :: Database -> IO ()
+msync db = do
+  FileArray.msync $ dbKeysArray db
+  GrowingFile.msync $ dbValues db

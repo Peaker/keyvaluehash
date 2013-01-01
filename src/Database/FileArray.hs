@@ -4,6 +4,7 @@ module Database.FileArray
   , create, open, close
   , Element(..)
   , unsafeElement -- no index checks
+  , msync
   ) where
 
 import Control.Monad (when)
@@ -17,9 +18,10 @@ import qualified Control.Exception as Exc
 import qualified Foreign.Storable as Storable
 import qualified System.IO as IO
 import qualified System.IO.MMap as MMap
+import qualified System.IO.MMap.Sync as MMapSync
 
 data FileArray a = FileArray
-  { _faCount :: Word64
+  { faCount :: Word64
   , faPtr :: ForeignPtr a
   }
 
@@ -69,3 +71,12 @@ unsafeElement fileArray ix =
   withForeignPtr (faPtr fileArray) $ \keysPtr -> do
     let ptr = keysPtr `plusPtr` fromIntegral (ix * elementSize fileArray)
     return $ Element (Storable.peek ptr) (Storable.poke ptr)
+
+msync :: Storable a => FileArray a -> IO ()
+msync fileArray =
+  withForeignPtr (faPtr fileArray) $
+  \ptr ->
+  MMapSync.msync ptr (fromIntegral fileSize)
+  (Just MMapSync.Async) MMapSync.NoInvalidate
+  where
+    fileSize = faCount fileArray * elementSize fileArray
