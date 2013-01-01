@@ -16,7 +16,7 @@ import Data.Binary.Get (runGet)
 import Data.Binary.Put (runPut)
 import Data.Derive.Binary(makeBinary)
 import Data.DeriveTH(derive)
-import Data.Hashable (hash)
+import Data.Hashable (hashWithSalt)
 import Data.List (intercalate)
 import Data.Monoid (mconcat)
 import Data.Typeable (Typeable)
@@ -67,7 +67,7 @@ mkHashFunc name f = HashFunction
   }
 
 stdHash :: HashFunction
-stdHash = mkHashFunc "Hashable" (fromIntegral . hash)
+stdHash = mkHashFunc "Hashable" (fromIntegral . hashWithSalt 0xDEADBEEF)
 
 type ValuePtr = Word64 -- offset in values file
 type KeyPtr = Word64 -- index in key file
