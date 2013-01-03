@@ -1,12 +1,22 @@
 name:                keyvaluehash
 version:             0.3.1
 synopsis:            Pure Haskell key/value store implementation
--- description:
+description:         A simple bytestring key/value store implemented
+                     in terms of hash table over a file.
+
+                     It cannot yet grow/shrink the hash table as
+                     needed, nor does it free old unused (key,value)
+                     pair storage.
+
+                     Mostly useful for applications that need not
+                     worry about the size of their persistent store.
+
+                     Reduces dependency hell.
 license:             BSD3
 license-file:        LICENSE
 author:              Eyal Lotem
 maintainer:          eyal.lotem@gmail.com
--- copyright:
+copyright:           Eyal Lotem
 category:            Database
 build-type:          Simple
 cabal-version:       >=1.8
@@ -24,3 +34,7 @@ library
       C-sources:       cbits/win32.c
   else
       C-sources:       cbits/posix.c
+
+source-repository head
+  type: git
+  location: https://github.com/Peaker/keyvaluehash.git
