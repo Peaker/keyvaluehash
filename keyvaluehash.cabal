@@ -1,5 +1,5 @@
 name:                keyvaluehash
-version:             0.3.1
+version:             0.3.1.1
 synopsis:            Pure Haskell key/value store implementation
 description:         A simple bytestring key/value store implemented
                      in terms of hash table over a file.
@@ -20,6 +20,7 @@ copyright:           Eyal Lotem
 category:            Database
 build-type:          Simple
 cabal-version:       >=1.8
+Extra-Source-Files:  cbits/HsMsync.h
 
 library
   hs-Source-Dirs:      src
