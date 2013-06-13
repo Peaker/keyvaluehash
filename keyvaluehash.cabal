@@ -1,5 +1,5 @@
 name:                keyvaluehash
-version:             0.3.1.1
+version:             0.3.1.2
 synopsis:            Pure Haskell key/value store implementation
 description:         A simple bytestring key/value store implemented
                      in terms of hash table over a file.
